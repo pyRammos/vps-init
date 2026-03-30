@@ -6,21 +6,6 @@
 #   curl -fsSL https://raw.githubusercontent.com/pyRammos/vps-init/main/init.sh | bash
 #   OR after cloning:
 #   sudo bash init.sh
-#
-# What this does (in order):
-#   1.  Verify Debian 13 + root
-#   2.  Create george user (uid 1000, gid 100)
-#   3.  Install SSH public key + harden SSH
-#   4.  Install base packages + Docker + fail2ban
-#   5.  Configure WireGuard as CLIENT to UDM
-#       - Accepts pasted config from UDM
-#       - Tests for AllowedIPs = 0.0.0.0/0 and injects it if missing
-#       - Tests for DNS line and warns if missing
-#   6.  Install WireGuard watchdog (safety net if tunnel drops)
-#   7.  Start WireGuard (point of no return)
-#   8.  Verify tunnel to home LAN
-#   9.  Clone george/homelab from Gitea over tunnel
-#   10. Print next steps
 
 set -euo pipefail
 
@@ -60,6 +45,7 @@ ok "Original gateway: ${ORIGINAL_GW} via ${ORIGINAL_IFACE}"
 # ── 2. Create george user ─────────────────────────────────────────────────────
 header "User setup"
 
+# Ensure gid 100 exists as 'users' group (matches OMV)
 if ! getent group 100 &>/dev/null; then
     groupadd --gid 100 users
     ok "Created group 'users' (gid 100)"
@@ -70,6 +56,19 @@ fi
 if id george &>/dev/null; then
     ok "User 'george' already exists"
 else
+    # uid 1000 may already be taken by a default user (e.g. 'debian' on Kimsufi)
+    # If so, reassign that user's uid to 1001 to free up 1000 for george
+    EXISTING_UID1000=$(getent passwd 1000 | cut -d: -f1 || true)
+    if [[ -n "${EXISTING_UID1000}" ]]; then
+        warn "UID 1000 is taken by '${EXISTING_UID1000}' — reassigning to UID 1001"
+        usermod -u 1001 "${EXISTING_UID1000}"
+        # Fix ownership of their home dir
+        EXISTING_HOME=$(getent passwd 1001 | cut -d: -f6 || true)
+        [[ -n "${EXISTING_HOME}" && -d "${EXISTING_HOME}" ]] && \
+            chown -R 1001 "${EXISTING_HOME}" || true
+        ok "Reassigned '${EXISTING_UID1000}' to UID 1001"
+    fi
+
     useradd \
         --uid 1000 \
         --gid 100 \
@@ -80,6 +79,7 @@ else
     ok "Created user george (uid 1000, gid 100)"
 fi
 
+# Ensure george is in sudo and docker groups
 usermod -aG sudo george
 ok "george has sudo access"
 
@@ -221,7 +221,7 @@ EXAMPLE
     WG_CONFIG=$(cat)
     [[ -n "${WG_CONFIG}" ]] || die "No WireGuard config provided"
 
-    # ── Validate structure ────────────────────────────────────────────────
+    # Validate structure
     echo "${WG_CONFIG}" | grep -q "^\[Interface\]" || \
         die "Config missing [Interface] section — check the paste"
     echo "${WG_CONFIG}" | grep -q "PrivateKey" || \
@@ -229,7 +229,7 @@ EXAMPLE
     echo "${WG_CONFIG}" | grep -q "\[Peer\]" || \
         die "Config missing [Peer] section — check the paste"
 
-    # ── Inject AllowedIPs = 0.0.0.0/0 if missing or incomplete ──────────
+    # Inject AllowedIPs = 0.0.0.0/0 if missing or incomplete
     if echo "${WG_CONFIG}" | grep -q "AllowedIPs"; then
         EXISTING_ALLOWED=$(echo "${WG_CONFIG}" | grep "AllowedIPs" | head -1)
         if echo "${EXISTING_ALLOWED}" | grep -q "0\.0\.0\.0/0"; then
@@ -237,7 +237,7 @@ EXAMPLE
         else
             warn "AllowedIPs found but does not include 0.0.0.0/0"
             warn "Found: ${EXISTING_ALLOWED}"
-            warn "Replacing with AllowedIPs = 0.0.0.0/0 for full tunnel routing"
+            warn "Replacing with AllowedIPs = 0.0.0.0/0"
             WG_CONFIG=$(echo "${WG_CONFIG}" | sed 's|^AllowedIPs.*|AllowedIPs = 0.0.0.0/0|')
             ok "AllowedIPs replaced with 0.0.0.0/0"
         fi
@@ -247,7 +247,7 @@ EXAMPLE
         ok "AllowedIPs = 0.0.0.0/0 injected"
     fi
 
-    # ── Warn if DNS is missing ────────────────────────────────────────────
+    # Warn if DNS is missing
     if ! echo "${WG_CONFIG}" | grep -q "^DNS"; then
         warn "No DNS line found in config."
         warn "Internal domains (*.rammos.me) won't resolve without it."
@@ -258,7 +258,6 @@ EXAMPLE
         ok "DNS line present in config"
     fi
 
-    # ── Write config ──────────────────────────────────────────────────────
     echo "${WG_CONFIG}" > "${WG_CONF}"
     chmod 600 "${WG_CONF}"
     ok "WireGuard config written to ${WG_CONF}"
@@ -457,13 +456,11 @@ else
         sudo -u george git clone \
             https://gitea.rammos.me/george/homelab.git \
             "${HOMELAB_DIR}"
-        sudo -u george git -C "${HOMELAB_DIR}" checkout dr
-        ok "Homelab repo cloned at ${HOMELAB_DIR} (dr branch)"
+        ok "Homelab repo cloned at ${HOMELAB_DIR}"
     else
         warn "DNS not resolving — skipping homelab clone"
         warn "Once DNS is fixed, run manually:"
         warn "  sudo -u george git clone https://gitea.rammos.me/george/homelab.git ~/homelab"
-        warn "  git -C ~/homelab checkout dr"
     fi
 fi
 
