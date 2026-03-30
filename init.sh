@@ -5,9 +5,15 @@
 # Run as root on a fresh Debian 13 VPS:
 #   curl -fsSL https://raw.githubusercontent.com/pyRammos/vps-init/main/init.sh | bash
 #   OR after cloning:
-#   sudo bash init.sh
+#   bash init.sh
+#
+# NOTE: Run as root directly or via 'sudo su -' (login shell).
+# Plain 'su' without '-' drops /usr/sbin from PATH and breaks user management.
 
 set -euo pipefail
+
+# Ensure /usr/sbin is in PATH (missing when using plain 'su' without '-')
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -47,7 +53,7 @@ header "User setup"
 
 # Ensure gid 100 exists as 'users' group (matches OMV)
 if ! getent group 100 &>/dev/null; then
-    groupadd --gid 100 users
+    /usr/sbin/groupadd --gid 100 users
     ok "Created group 'users' (gid 100)"
 else
     ok "Group gid 100 exists: $(getent group 100 | cut -d: -f1)"
@@ -57,19 +63,18 @@ if id george &>/dev/null; then
     ok "User 'george' already exists"
 else
     # uid 1000 may already be taken by a default user (e.g. 'debian' on Kimsufi)
-    # If so, reassign that user's uid to 1001 to free up 1000 for george
+    # Reassign that user to uid 1001 to free up 1000 for george
     EXISTING_UID1000=$(getent passwd 1000 | cut -d: -f1 || true)
     if [[ -n "${EXISTING_UID1000}" ]]; then
         warn "UID 1000 is taken by '${EXISTING_UID1000}' — reassigning to UID 1001"
-        usermod -u 1001 "${EXISTING_UID1000}"
-        # Fix ownership of their home dir
+        /usr/sbin/usermod -u 1001 "${EXISTING_UID1000}"
         EXISTING_HOME=$(getent passwd 1001 | cut -d: -f6 || true)
         [[ -n "${EXISTING_HOME}" && -d "${EXISTING_HOME}" ]] && \
             chown -R 1001 "${EXISTING_HOME}" || true
         ok "Reassigned '${EXISTING_UID1000}' to UID 1001"
     fi
 
-    useradd \
+    /usr/sbin/useradd \
         --uid 1000 \
         --gid 100 \
         --create-home \
@@ -79,8 +84,7 @@ else
     ok "Created user george (uid 1000, gid 100)"
 fi
 
-# Ensure george is in sudo and docker groups
-usermod -aG sudo george
+/usr/sbin/usermod -aG sudo george
 ok "george has sudo access"
 
 # ── 3. SSH key + hardening ────────────────────────────────────────────────────
@@ -182,7 +186,7 @@ $(lsb_release -cs) stable" \
     apt-get install -y docker-ce docker-ce-cli containerd.io \
         docker-buildx-plugin docker-compose-plugin
     systemctl enable docker
-    usermod -aG docker george
+    /usr/sbin/usermod -aG docker george
     ok "Docker installed"
 else
     ok "Docker already installed: $(docker --version)"
@@ -280,12 +284,6 @@ header "Installing WireGuard watchdog"
 cat > /usr/local/bin/wg-watchdog.sh <<'WATCHDOG'
 #!/usr/bin/env bash
 # wg-watchdog.sh — WireGuard tunnel health monitor
-# Pings OMV every run. On 3 consecutive failures:
-#   - Brings WireGuard down
-#   - Restores direct internet access
-#   - Sends Pushover alert
-#   - After 30 minutes, restarts WireGuard automatically
-
 set -euo pipefail
 
 CONF="/etc/wireguard/original-gw.conf"
