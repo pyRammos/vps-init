@@ -7,10 +7,11 @@
 #   OR after cloning:
 #   bash init.sh
 #
-# NOTE: Run as root directly or via 'sudo su -' (login shell).
-# 'sudo su' without '-' works too — we export full PATH at the top.
-# You can run this even while SSH'd in as the 'debian' user (sudo su),
-# because root renames the identity, not the running process.
+# NOTE: Run as root directly or via 'sudo su' (plain or login shell).
+# We export full PATH at the top so /usr/sbin tools are always found.
+# Safe to run while SSH'd in as the default user (e.g. 'debian') —
+# the script terminates that user's systemd session before renaming,
+# which is the only thing that blocks usermod on an active UID.
 
 set -euo pipefail
 
@@ -65,22 +66,38 @@ if id george &>/dev/null; then
     ok "User 'george' already exists — skipping user setup"
 else
     # Kimsufi and similar providers ship a default user (e.g. 'debian') at
-    # UID 1000. We cannot useradd george at 1000 while that user exists.
-    #
-    # Strategy: if UID 1000 is taken by a non-george user, rename it to
-    # george in-place. This works even with an active SSH session because
-    # root is modifying the identity record, not the running process.
+    # UID 1000. Strategy: if UID 1000 is taken, terminate that user's entire
+    # session (kills systemd --user and any lingering processes — this is what
+    # actually blocks usermod), then rename the user to george in-place.
+    # The current root shell is unaffected by session termination.
     EXISTING_UID1000=$(getent passwd 1000 | cut -d: -f1 || true)
 
     if [[ -n "${EXISTING_UID1000}" ]]; then
-        warn "UID 1000 is owned by '${EXISTING_UID1000}' — renaming to 'george' in-place"
+        warn "UID 1000 is owned by '${EXISTING_UID1000}' — terminating session and renaming to 'george'"
+
+        # Kill the user's entire login session (systemd --user, PAM, etc.)
+        if loginctl terminate-user "${EXISTING_UID1000}" 2>/dev/null; then
+            ok "Terminated '${EXISTING_UID1000}' session"
+            sleep 2
+        else
+            warn "loginctl: no active session to terminate (already clean)"
+        fi
+
+        # Belt-and-suspenders: kill any remaining processes under this UID
+        REMAINING_PIDS=$(pgrep -u "${EXISTING_UID1000}" 2>/dev/null || true)
+        if [[ -n "${REMAINING_PIDS}" ]]; then
+            warn "Killing remaining processes owned by '${EXISTING_UID1000}': ${REMAINING_PIDS}"
+            # shellcheck disable=SC2086
+            kill -9 ${REMAINING_PIDS} 2>/dev/null || true
+            sleep 1
+        fi
 
         OLD_HOME=$(getent passwd "${EXISTING_UID1000}" | cut -d: -f6)
 
-        # Rename the login name and update GECOS
+        # Rename login name + GECOS
         /usr/sbin/usermod -l george -c "George" "${EXISTING_UID1000}"
 
-        # Rename the private group if it matches the old username
+        # Rename private group if it matches the old username
         if getent group "${EXISTING_UID1000}" &>/dev/null; then
             /usr/sbin/groupmod -n george "${EXISTING_UID1000}"
             ok "Renamed group '${EXISTING_UID1000}' → 'george'"
@@ -92,11 +109,8 @@ else
             ok "Moved ${OLD_HOME} → /home/george"
         fi
 
-        # Update home path in passwd
-        /usr/sbin/usermod -d /home/george george
-
-        # Set primary group to 'users' (gid 100) — matching OMV
-        /usr/sbin/usermod -g 100 george
+        # Update home path in passwd and set primary group to 'users' (gid 100)
+        /usr/sbin/usermod -d /home/george -g 100 george
 
         ok "Renamed '${EXISTING_UID1000}' → 'george' (uid 1000, gid 100)"
     else
