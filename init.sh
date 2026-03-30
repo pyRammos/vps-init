@@ -8,14 +8,16 @@
 #   bash init.sh
 #
 # NOTE: Run as root directly or via 'sudo su -' (login shell).
-# Plain 'su' without '-' drops /usr/sbin from PATH and breaks user management.
+# 'sudo su' without '-' works too — we export full PATH at the top.
+# You can run this even while SSH'd in as the 'debian' user (sudo su),
+# because root renames the identity, not the running process.
 
 set -euo pipefail
 
 # Ensure /usr/sbin is in PATH (missing when using plain 'su' without '-')
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# ── Colours ───────────────────────────────────────────────────────────────────
+# ── Colours ────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
@@ -26,7 +28,7 @@ err()    { echo -e "${RED}✗ $*${RESET}" >&2; }
 die()    { err "$*"; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}══ $* ══${RESET}\n"; }
 
-# ── 1. Pre-flight ─────────────────────────────────────────────────────────────
+# ── 1. Pre-flight ──────────────────────────────────────────────────────────
 header "Pre-flight checks"
 
 [[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo bash init.sh"
@@ -48,7 +50,7 @@ ORIGINAL_IFACE=$(ip route | awk '/^default/ {print $5; exit}')
 [[ -n "${ORIGINAL_GW}" ]] || die "Cannot determine default gateway"
 ok "Original gateway: ${ORIGINAL_GW} via ${ORIGINAL_IFACE}"
 
-# ── 2. Create george user ─────────────────────────────────────────────────────
+# ── 2. Create george user ──────────────────────────────────────────────────
 header "User setup"
 
 # Ensure gid 100 exists as 'users' group (matches OMV)
@@ -60,34 +62,67 @@ else
 fi
 
 if id george &>/dev/null; then
-    ok "User 'george' already exists"
+    ok "User 'george' already exists — skipping user setup"
 else
-    # uid 1000 may already be taken by a default user (e.g. 'debian' on Kimsufi)
-    # Reassign that user to uid 1001 to free up 1000 for george
+    # Kimsufi and similar providers ship a default user (e.g. 'debian') at
+    # UID 1000. We cannot useradd george at 1000 while that user exists.
+    #
+    # Strategy: if UID 1000 is taken by a non-george user, rename it to
+    # george in-place. This works even with an active SSH session because
+    # root is modifying the identity record, not the running process.
     EXISTING_UID1000=$(getent passwd 1000 | cut -d: -f1 || true)
-    if [[ -n "${EXISTING_UID1000}" ]]; then
-        warn "UID 1000 is taken by '${EXISTING_UID1000}' — reassigning to UID 1001"
-        /usr/sbin/usermod -u 1001 "${EXISTING_UID1000}"
-        EXISTING_HOME=$(getent passwd 1001 | cut -d: -f6 || true)
-        [[ -n "${EXISTING_HOME}" && -d "${EXISTING_HOME}" ]] && \
-            chown -R 1001 "${EXISTING_HOME}" || true
-        ok "Reassigned '${EXISTING_UID1000}' to UID 1001"
-    fi
 
-    /usr/sbin/useradd \
-        --uid 1000 \
-        --gid 100 \
-        --create-home \
-        --shell /bin/bash \
-        --groups sudo \
-        george
-    ok "Created user george (uid 1000, gid 100)"
+    if [[ -n "${EXISTING_UID1000}" ]]; then
+        warn "UID 1000 is owned by '${EXISTING_UID1000}' — renaming to 'george' in-place"
+
+        OLD_HOME=$(getent passwd "${EXISTING_UID1000}" | cut -d: -f6)
+
+        # Rename the login name and update GECOS
+        /usr/sbin/usermod -l george -c "George" "${EXISTING_UID1000}"
+
+        # Rename the private group if it matches the old username
+        if getent group "${EXISTING_UID1000}" &>/dev/null; then
+            /usr/sbin/groupmod -n george "${EXISTING_UID1000}"
+            ok "Renamed group '${EXISTING_UID1000}' → 'george'"
+        fi
+
+        # Move home directory
+        if [[ -d "${OLD_HOME}" && "${OLD_HOME}" != "/home/george" ]]; then
+            mv "${OLD_HOME}" /home/george
+            ok "Moved ${OLD_HOME} → /home/george"
+        fi
+
+        # Update home path in passwd
+        /usr/sbin/usermod -d /home/george george
+
+        # Set primary group to 'users' (gid 100) — matching OMV
+        /usr/sbin/usermod -g 100 george
+
+        ok "Renamed '${EXISTING_UID1000}' → 'george' (uid 1000, gid 100)"
+    else
+        # UID 1000 is free — create george fresh
+        /usr/sbin/useradd \
+            --uid 1000 \
+            --gid 100 \
+            --create-home \
+            --shell /bin/bash \
+            --groups sudo \
+            george
+        ok "Created user george (uid 1000, gid 100)"
+    fi
 fi
 
 /usr/sbin/usermod -aG sudo george
 ok "george has sudo access"
 
-# ── 3. SSH key + hardening ────────────────────────────────────────────────────
+# Verify
+GEORGE_UID=$(id -u george)
+GEORGE_GID=$(id -g george)
+[[ "${GEORGE_UID}" -eq 1000 ]] || die "george UID is ${GEORGE_UID}, expected 1000"
+[[ "${GEORGE_GID}" -eq 100 ]]  || die "george GID is ${GEORGE_GID}, expected 100 (users)"
+ok "Verified: george uid=${GEORGE_UID} gid=${GEORGE_GID}"
+
+# ── 3. SSH key + hardening ─────────────────────────────────────────────────
 header "SSH configuration"
 
 SSH_DIR="/home/george/.ssh"
@@ -145,7 +180,7 @@ read -r -p "  Have you verified SSH access as george in a separate terminal? (ye
     [[ "${ssh_check2}" == "yes" ]] || die "Aborted. Fix SSH access before proceeding."
 }
 
-# ── 4. Base packages + Docker + fail2ban ──────────────────────────────────────
+# ── 4. Base packages + Docker + fail2ban ──────────────────────────────────
 header "Installing packages"
 
 apt-get update -qq
@@ -196,7 +231,7 @@ systemctl enable fail2ban
 systemctl start fail2ban
 ok "fail2ban enabled"
 
-# ── 5. WireGuard configuration ────────────────────────────────────────────────
+# ── 5. WireGuard configuration ─────────────────────────────────────────────
 header "WireGuard setup"
 
 WG_CONF="/etc/wireguard/wg0.conf"
@@ -278,7 +313,7 @@ ORIGINAL_IFACE=${ORIGINAL_IFACE}
 EOF
 ok "Original gateway saved for watchdog"
 
-# ── 6. WireGuard watchdog ─────────────────────────────────────────────────────
+# ── 6. WireGuard watchdog ──────────────────────────────────────────────────
 header "Installing WireGuard watchdog"
 
 cat > /usr/local/bin/wg-watchdog.sh <<'WATCHDOG'
@@ -388,11 +423,11 @@ systemctl daemon-reload
 systemctl enable wg-watchdog.timer
 ok "Watchdog installed (checks every 2 min, 30-min recovery window)"
 
-# ── 7. Start WireGuard ────────────────────────────────────────────────────────
+# ── 7. Start WireGuard ─────────────────────────────────────────────────────
 header "Starting WireGuard"
 
 echo ""
-warn "═══════════════════════════════════════════════════════════"
+warn "╔══════════════════════════════════════════════════════════╗"
 warn "  POINT OF NO RETURN"
 warn ""
 warn "  WireGuard will start with AllowedIPs = 0.0.0.0/0"
@@ -406,7 +441,7 @@ warn "  ✓ Password auth disabled"
 warn "  ✓ UDM WireGuard server is running"
 warn "  ✓ home.rammos.family resolves to your home IP"
 warn "  ✓ VPS is added as a peer on UDM with AllowedIPs = 10.100.0.x/32"
-warn "═══════════════════════════════════════════════════════════"
+warn "╚══════════════════════════════════════════════════════════╝"
 echo ""
 read -r -p "  Start WireGuard now? (yes/no): " start_wg
 [[ "${start_wg}" == "yes" ]] || die "Aborted. Run 'systemctl start wg-quick@wg0' when ready."
@@ -415,7 +450,7 @@ systemctl enable wg-quick@wg0
 systemctl start wg-quick@wg0
 sleep 5
 
-# ── 8. Verify tunnel ──────────────────────────────────────────────────────────
+# ── 8. Verify tunnel ──────────────────────────────────────────────────────
 header "Verifying tunnel"
 
 log "Testing connectivity to OMV (10.0.0.99)..."
@@ -441,7 +476,7 @@ fi
 systemctl start wg-watchdog.timer
 ok "Watchdog timer started"
 
-# ── 9. Clone homelab repo ─────────────────────────────────────────────────────
+# ── 9. Clone homelab repo ──────────────────────────────────────────────────
 header "Cloning homelab repo"
 
 HOMELAB_DIR="/home/george/homelab"
@@ -462,9 +497,9 @@ else
     fi
 fi
 
-# ── 10. Summary ───────────────────────────────────────────────────────────────
+# ── 10. Summary ────────────────────────────────────────────────────────────
 echo ""
-echo -e "${GREEN}════════════════════════════════════════════════════════════${RESET}"
+echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${RESET}"
 echo -e "${GREEN}  ✅  VPS initialisation complete${RESET}"
 echo ""
 echo "  System:"
@@ -483,4 +518,4 @@ echo "    • Checks tunnel every 2 minutes"
 echo "    • 3 failures → WG down, direct internet restored, Pushover alert"
 echo "    • 30-minute window to SSH in and fix"
 echo "    • After 30 minutes → WireGuard automatically restarts"
-echo -e "${GREEN}════════════════════════════════════════════════════════════${RESET}"
+echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${RESET}"
